@@ -1,5 +1,6 @@
 """Dev commands for the apx CLI."""
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Annotated
@@ -123,6 +124,29 @@ def dev_start(
             )
             delete_token_from_keyring(keyring_id)
             save_token_id(app_dir, token_id="")  # Clear the token_id
+
+            # Raise error and don't start the server
+            console.print(
+                "[red]❌ Failed to authenticate with Databricks. Cannot start server with --obo flag.[/red]"
+            )
+            console.print(
+                "[yellow]💡 Please check your Databricks credentials and try again.[/yellow]"
+            )
+
+            # If using a specific profile, show re-authentication command
+            profile_name = os.environ.get("DATABRICKS_CONFIG_PROFILE")
+            if profile_name:
+                console.print()
+                console.print(
+                    "[cyan]Use Databricks CLI to re-authenticate with identified profile:[/cyan]"
+                )
+                console.print()
+                console.print(
+                    f"  [bold]> databricks auth login -p {profile_name}[/bold]"
+                )
+                console.print()
+
+            raise Exit(code=1)
 
         console.print("[green]✓[/green] Databricks credentials validated")
         console.print()

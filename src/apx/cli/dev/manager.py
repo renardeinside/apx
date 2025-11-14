@@ -40,6 +40,10 @@ from apx.utils import (
     ensure_dir,
 )
 from apx import __version__
+from apx.cli.dev.process_cleanup import (
+    cleanup_orphaned_processes_double_pass,
+    cleanup_dev_server_processes,
+)
 
 
 # note: header name must be lowercase and with - symbols
@@ -957,41 +961,27 @@ class DevManager:
             raise Exit(code=1)
 
         # Preventive cleanup: kill any orphaned processes from previous failed stops
-        # This is silent - we only report if we find anything to clean up
-        try:
-            app_dir_str = str(self.app_dir.resolve())
-            orphans_found = False
+        # IMPORTANT: This prevents duplicate frontend servers
+        console.print(
+            "[cyan]🧹 Checking for orphaned processes from previous session...[/cyan]"
+        )
 
-            for proc in psutil.process_iter(["pid", "name", "cwd", "cmdline"]):
-                try:
-                    cmdline = proc.cmdline()
-                    if not cmdline:
-                        continue
+        # Clean up dev server processes first
+        dev_server_killed = cleanup_dev_server_processes(self.app_dir, silent=True)
 
-                    cmdline_str = " ".join(cmdline)
+        # Clean up build tool processes (vite/bun/node/esbuild) with double-pass
+        build_tools_killed = cleanup_orphaned_processes_double_pass(
+            self.app_dir,
+            ports=None,  # Will find available ports later
+            silent=True,
+            delay=0.5,
+        )
 
-                    # Check for orphaned dev server or frontend processes
-                    if app_dir_str in cmdline_str:
-                        if (
-                            "apx" in cmdline_str
-                            and "dev" in cmdline_str
-                            and "_run_server" in cmdline_str
-                        ) or proc.name() in ["bun", "node", "vite", "esbuild"]:
-                            if not orphans_found:
-                                console.print(
-                                    "[cyan]🧹 Cleaning up orphaned processes from previous session...[/cyan]"
-                                )
-                                orphans_found = True
-                            proc.kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                    pass
-
-            if orphans_found:
-                # Wait a bit for processes to die
-                time.sleep(0.5)
-                console.print("[green]✓[/green] Cleanup complete")
-        except Exception:
-            pass  # Silent failure - this is just a preventive measure
+        if dev_server_killed > 0 or build_tools_killed > 0:
+            total = dev_server_killed + build_tools_killed
+            console.print(f"[green]✓[/green] Cleaned up {total} orphaned process(es)")
+        else:
+            console.print("[dim]No orphaned processes found[/dim]")
 
         # Find available ports
         console.print("[cyan]🔍 Finding available ports...[/cyan]")
@@ -1181,7 +1171,10 @@ class DevManager:
             console.print(f"[yellow]⚠️  Could not connect to dev server: {e}[/yellow]")
 
     def stop(self):
-        """Stop development server."""
+        """Stop development server.
+
+        Ensures all vite, bun, node, esbuild processes are explicitly killed.
+        """
         if not self.is_dev_server_running():
             console.print("[yellow]No development server found.[/yellow]")
             return
@@ -1191,24 +1184,36 @@ class DevManager:
         # Try to send stop request to dev server first
         client = DevServerClient(self.socket_path)
 
-        api_success = False
         try:
             response = client.stop()
             if response.status == "success":
                 console.print("[green]✓[/green] Stopped all servers via API")
-                api_success = True
         except Exception:
             # If API fails, we'll need to forcefully clean up processes
             console.print(
                 "[yellow]⚠️  Could not stop gracefully via API, server may have crashed[/yellow]"
             )
 
-        # If API stop failed, forcefully kill any orphaned processes
-        if not api_success:
-            console.print("[cyan]🧹 Cleaning up orphaned processes...[/cyan]")
-            self._cleanup_orphaned_processes()
-            # Give processes time to fully terminate
-            time.sleep(0.5)
+        # Always do cleanup to ensure all processes are killed (double-pass)
+        console.print(
+            "[cyan]🧹 Ensuring all build tool processes are terminated...[/cyan]"
+        )
+
+        # Clean up dev server processes
+        cleanup_dev_server_processes(self.app_dir, silent=True)
+
+        # Clean up build tool processes with double-pass
+        killed_count = cleanup_orphaned_processes_double_pass(
+            self.app_dir,
+            ports=None,  # Don't filter by port, kill all
+            silent=True,
+            delay=0.5,
+        )
+
+        if killed_count > 0:
+            console.print(f"[green]✓[/green] Terminated {killed_count} process(es)")
+        else:
+            console.print("[green]✓[/green] All processes terminated")
 
         # Wait for socket to be removed (whether by API or by our cleanup)
         max_wait = 3  # seconds
@@ -1226,79 +1231,6 @@ class DevManager:
             "[bold green]✨ Development server stopped successfully![/bold green]"
         )
         console.print("[dim]Token remains valid in keyring until expiration[/dim]")
-
-    def _cleanup_orphaned_processes(self) -> None:
-        """Kill any orphaned dev server and frontend/backend processes.
-
-        This is called when the API stop fails to ensure all processes are cleaned up.
-        """
-        try:
-            killed: list[str] = []
-            app_dir_str = str(self.app_dir.resolve())
-
-            # Find and kill processes related to our app
-            for proc in psutil.process_iter(["pid", "name", "cwd", "cmdline"]):
-                try:
-                    cmdline = proc.cmdline()
-                    if not cmdline:
-                        continue
-
-                    # Join cmdline for easier checking
-                    cmdline_str = " ".join(cmdline)
-
-                    # Check if this is a dev server process for our app directory
-                    # Look for: "apx dev _run_server" with our app directory path
-                    if (
-                        "apx" in cmdline_str
-                        and "dev" in cmdline_str
-                        and "_run_server" in cmdline_str
-                    ):
-                        if app_dir_str in cmdline_str:
-                            proc.kill()
-                            killed.append(f"dev-server (PID {proc.pid})")
-                            continue
-
-                    # Check if process is bun/node/vite/esbuild in our app directory
-                    if proc.name() in ["bun", "node", "vite", "esbuild"]:
-                        try:
-                            cwd = proc.cwd()
-                            if cwd and Path(cwd).resolve() == self.app_dir.resolve():
-                                proc.kill()
-                                killed.append(f"{proc.name()} (PID {proc.pid})")
-                                continue
-                        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                            pass
-
-                    # Also check if command line references our app directory
-                    if app_dir_str in cmdline_str:
-                        # Check if it's a bun/node/vite/esbuild process
-                        if proc.name() in ["bun", "node", "vite", "esbuild"]:
-                            proc.kill()
-                            killed.append(f"{proc.name()} (PID {proc.pid})")
-                            continue
-                        # Also check if command line contains these names
-                        cmdline_lower = cmdline_str.lower()
-                        if any(
-                            name in cmdline_lower for name in ["bun", "vite", "esbuild"]
-                        ):
-                            proc.kill()
-                            killed.append(f"{proc.name()} (PID {proc.pid})")
-                            continue
-
-                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                    pass
-
-            if killed:
-                console.print(
-                    f"[green]✓[/green] Cleaned up {len(killed)} orphaned process(es)"
-                )
-            else:
-                console.print("[dim]No orphaned processes found[/dim]")
-
-        except Exception as e:
-            console.print(
-                f"[yellow]⚠️  Failed to cleanup orphaned processes: {e}[/yellow]"
-            )
 
     def stream_logs(
         self,

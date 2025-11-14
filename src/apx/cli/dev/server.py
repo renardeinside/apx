@@ -45,6 +45,7 @@ from apx.cli.dev.logging import (
     LoggerWriter,
     setup_buffered_logging,
 )
+from apx.cli.dev.process_cleanup import cleanup_orphaned_processes_double_pass
 
 
 # Global state for background tasks
@@ -72,57 +73,7 @@ state = ServerState()
 
 
 # === Process Cleanup ===
-
-
-def cleanup_orphaned_processes(app_dir: Path, ports: list[int] | None = None):
-    """Kill any orphaned frontend/backend processes.
-
-    This ensures a clean slate when starting servers.
-
-    Args:
-        app_dir: Application directory
-        ports: Optional list of ports to check for orphaned processes
-    """
-    try:
-        import psutil
-
-        # Find processes using the specified ports
-        killed = []
-        if ports:
-            for proc in psutil.process_iter(["pid", "name", "connections"]):
-                try:
-                    # Check if process is using any of our ports
-                    connections = proc.connections()
-                    for conn in connections:
-                        if (
-                            hasattr(conn, "laddr")
-                            and conn.laddr
-                            and hasattr(conn.laddr, "port")
-                        ):
-                            if conn.laddr.port in ports:
-                                proc.kill()
-                                killed.append(f"{proc.name()} (PID {proc.pid})")
-                                break
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-
-        # Also look for bun/node processes in our app directory
-        for proc in psutil.process_iter(["pid", "name", "cwd", "cmdline"]):
-            try:
-                if proc.name() in ["bun", "node", "vite"]:
-                    cwd = proc.cwd()
-                    if cwd and Path(cwd) == app_dir:
-                        proc.kill()
-                        killed.append(f"{proc.name()} (PID {proc.pid})")
-            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                pass
-
-        if killed:
-            logger = logging.getLogger("apx.server")
-            logger.info(f"Cleaned up orphaned processes: {', '.join(killed)}")
-    except Exception as e:
-        logger = logging.getLogger("apx.server")
-        logger.warning(f"Failed to cleanup orphaned processes: {e}")
+# Note: Cleanup functions are now in apx.cli.dev.process_cleanup module
 
 
 async def kill_process_group(process: asyncio.subprocess.Process, timeout: float = 5.0):
@@ -334,6 +285,16 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
             except asyncio.CancelledError:
                 pass
 
+        # Aggressive cleanup: kill all vite/bun/node/esbuild processes (double-pass)
+        if state.app_dir:
+            logger = logging.getLogger("apx.server")
+            cleanup_orphaned_processes_double_pass(
+                state.app_dir,
+                ports=[state.frontend_port, state.backend_port],
+                logger=logger,
+                delay=0.3,
+            )
+
 
 # === FastAPI App ===
 
@@ -386,7 +347,10 @@ def create_dev_server(app_dir: Path) -> FastAPI:
 
     @app.post("/actions/start", response_model=ActionResponse)
     async def start_servers(request: ActionRequest) -> ActionResponse:
-        """Start all development servers."""
+        """Start all development servers.
+
+        Ensures cleanup before starting to prevent duplicate frontend servers.
+        """
         # Check if already running
         if (
             state.frontend_task
@@ -398,10 +362,16 @@ def create_dev_server(app_dir: Path) -> FastAPI:
         ):
             return ActionResponse(status="error", message="Servers are already running")
 
-        # Kill any orphaned processes before starting
+        # IMPORTANT: Kill any orphaned processes before starting to prevent duplicates
+        # This includes vite/bun/node/esbuild from previous failed sessions
         if state.app_dir:
-            cleanup_orphaned_processes(
-                state.app_dir, ports=[request.frontend_port, request.backend_port]
+            logger = logging.getLogger("apx.server")
+            logger.info("Cleaning up any orphaned processes before starting servers...")
+            cleanup_orphaned_processes_double_pass(
+                state.app_dir,
+                ports=[request.frontend_port, request.backend_port],
+                logger=logger,
+                delay=0.5,
             )
 
         # Store configuration
@@ -454,7 +424,10 @@ def create_dev_server(app_dir: Path) -> FastAPI:
 
     @app.post("/actions/stop", response_model=ActionResponse)
     async def stop_servers() -> ActionResponse:
-        """Stop all development servers."""
+        """Stop all development servers.
+
+        Explicitly kills all vite, bun, node, esbuild processes to ensure clean shutdown.
+        """
         stopped: list[str] = []
         # Cancel tasks
         if state.frontend_task and not state.frontend_task.done():
@@ -479,10 +452,7 @@ def create_dev_server(app_dir: Path) -> FastAPI:
                     )
                 except RuntimeError:
                     # If port release failed after retries, do a final cleanup
-                    if state.app_dir:
-                        cleanup_orphaned_processes(
-                            state.app_dir, ports=[state.frontend_port]
-                        )
+                    pass  # Will be handled by the double-pass cleanup below
 
             state.frontend_process = None
             state.frontend_task = None
@@ -509,10 +479,14 @@ def create_dev_server(app_dir: Path) -> FastAPI:
         if not stopped:
             return ActionResponse(status="error", message="No servers were running")
 
-        # Final cleanup to ensure all orphaned processes are killed
+        # Aggressive double-pass cleanup to kill all vite/bun/node/esbuild processes
         if state.app_dir:
-            cleanup_orphaned_processes(
-                state.app_dir, ports=[state.frontend_port, state.backend_port]
+            logger = logging.getLogger("apx.server")
+            cleanup_orphaned_processes_double_pass(
+                state.app_dir,
+                ports=[state.frontend_port, state.backend_port],
+                logger=logger,
+                delay=0.5,
             )
 
         os.kill(os.getpid(), signal.SIGTERM)

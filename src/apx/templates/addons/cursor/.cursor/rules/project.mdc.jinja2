@@ -5,6 +5,11 @@ alwaysApply: true
 # Cursor Agent Rules
 
 # Do's and Don'ts
+- If the apx development servers are started, don't regenerate the OpenAPI client.
+- Prefer running apx related commands via mcp server if it's available.
+- Prefer to add new components via shadcn mcp server if it's available.
+- When using the API calls on the frontend, use error boundaries to handle errors.
+- Run apx dev check command (via CLI) to check for errors in the project code after making changes.
 
 ## Package Management
 - **Frontend:** Always use `bun` (never `npm`)
@@ -60,7 +65,7 @@ uv run apx dev stop
 uv run apx build
 ```
 
-**OpenAPI generation** (auto-runs with `dev start`):
+**OpenAPI generation** (auto-runs on each change with `dev start`):
 ```bash
 uv run apx openapi               # Generate once
 uv run apx openapi --watch       # Watch mode
